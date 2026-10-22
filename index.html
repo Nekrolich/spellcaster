@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spellcaster</title>
+<style>
+  html,body{margin:0;height:100%;background:#07060d;color:#e8e4ff;font-family:system-ui,sans-serif;overflow:hidden}
+  #stage{position:relative;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center}
+  video,canvas{position:absolute;max-width:100%;max-height:100%;transform:scaleX(-1)}
+  video{opacity:.45;filter:saturate(.6) brightness(.8)}
+  #hud{position:absolute;top:14px;left:16px;font-size:15px;line-height:1.6;text-shadow:0 0 8px #000;z-index:5}
+  #hud b{color:#ffb86b}
+  #start{position:absolute;z-index:10;padding:16px 34px;font-size:20px;border:0;border-radius:12px;
+    background:linear-gradient(135deg,#7b5cff,#ff5c9a);color:#fff;cursor:pointer;box-shadow:0 0 30px #7b5cff88}
+  #help{position:absolute;bottom:14px;left:16px;font-size:13px;opacity:.8;z-index:5;line-height:1.6;text-shadow:0 0 8px #000}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="hud">Gesture: <b id="g">-</b><br>Charge: <b id="c">0%</b></div>
+  <div id="help">
+    ☝️ Point = draw a glowing trail &nbsp;|&nbsp; ✊ Hold a fist = charge power<br>
+    🖐️ Open the fist = release a blast &nbsp;|&nbsp; ✌️ Peace = lightning &nbsp;|&nbsp; 🤏 Pinch = sparks
+  </div>
+  <button id="start">Start camera</button>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const gEl = document.getElementById("g");
+const cEl = document.getElementById("c");
+const startBtn = document.getElementById("start");
+
+let landmarker;
+let particles = [];
+let trail = [];
+let rings = [];
+let charge = 0;
+let lastGesture = "none";
+let stableGesture = "none";
+let stableCount = 0;
+let lastTime = performance.now();
+let lastVideoTime = -1;
+let lastHands = null;
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// ---------- Gesture recognition ----------
+function fingerExtended(lm, tip, pip) {
+  return dist(lm[tip], lm[0]) > dist(lm[pip], lm[0]) * 1.12;
+}
+
+function classify(lm) {
+  const index = fingerExtended(lm, 8, 6);
+  const middle = fingerExtended(lm, 12, 10);
+  const ring = fingerExtended(lm, 16, 14);
+  const pinky = fingerExtended(lm, 20, 18);
+  // thumb: tip farther from pinky base than the thumb's IP joint
+  const thumb = dist(lm[4], lm[17]) > dist(lm[3], lm[17]) * 1.05;
+
+  const handSize = dist(lm[0], lm[9]);
+  const pinching = dist(lm[4], lm[8]) < handSize * 0.28;
+
+  const count = [index, middle, ring, pinky].filter(Boolean).length;
+
+  if (pinching && middle && ring && pinky) return "pinch";
+  if (count === 0) return "fist";
+  if (index && !middle && !ring && !pinky) return "point";
+  if (index && middle && !ring && !pinky) return "peace";
+  if (count >= 4) return "open";
+  return "other";
+}
+
+// ---------- Effects ----------
+function burst(x, y, n, speed, hue, spread = Math.PI * 2, angle = 0) {
+  for (let i = 0; i < n; i++) {
+    const a = angle + (Math.random() - 0.5) * spread;
+    const s = speed * (0.3 + Math.random());
+    particles.push({
+      x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life: 1, decay: 0.4 + Math.random() * 0.8,
+      size: 2 + Math.random() * 4, hue: hue + Math.random() * 40 - 20
+    });
+  }
+}
+
+function lightning(x1, y1, x2, y2) {
+  const segs = 14;
+  const pts = [{ x: x1, y: y1 }];
+  for (let i = 1; i < segs; i++) {
+    const t = i / segs;
+    pts.push({
+      x: x1 + (x2 - x1) * t + (Math.random() - 0.5) * 60,
+      y: y1 + (y2 - y1) * t + (Math.random() - 0.5) * 60
+    });
+  }
+  pts.push({ x: x2, y: y2 });
+  return pts;
+}
+
+let bolts = [];
+
+function update(dt, gesture, lm) {
+  const w = canvas.width, h = canvas.height;
+  const P = i => ({ x: lm[i].x * w, y: lm[i].y * h });
+
+  // gesture transitions
+  if (gesture !== lastGesture) {
+    if (lastGesture === "fist" && gesture === "open" && charge > 0.25) {
+      const c = P(9);
+      const power = charge;
+      burst(c.x, c.y, Math.floor(80 + 220 * power), 250 + 500 * power, 20 + (1 - power) * 30);
+      rings.push({ x: c.x, y: c.y, r: 10, max: 150 + 350 * power, life: 1, hue: 30 });
+      charge = 0;
+    }
+    lastGesture = gesture;
+  }
+
+  if (gesture === "fist") {
+    charge = Math.min(1, charge + dt * 0.6);
+    const c = P(9);
+    if (Math.random() < 0.8) {
+      // particles spiral inward while charging
+      const a = Math.random() * Math.PI * 2;
+      const r = 60 + 80 * charge;
+      particles.push({
+        x: c.x + Math.cos(a) * r, y: c.y + Math.sin(a) * r,
+        vx: -Math.cos(a) * 120, vy: -Math.sin(a) * 120,
+        life: 0.6, decay: 1.2, size: 3, hue: 270 - charge * 240
+      });
+    }
+  } else if (gesture !== "open") {
+    charge = Math.max(0, charge - dt * 0.8);
+  }
+
+  if (gesture === "point") {
+    const t = P(8);
+    trail.push({ x: t.x, y: t.y, t: performance.now() });
+    if (Math.random() < 0.6) burst(t.x, t.y, 1, 40, 280, Math.PI * 2);
+  }
+
+  if (gesture === "pinch") {
+    const a = P(4), b = P(8);
+    burst((a.x + b.x) / 2, (a.y + b.y) / 2, 3, 120, 190);
+  }
+
+  if (gesture === "peace") {
+    const a = P(8), b = P(12);
+    const target = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    if (Math.random() < 0.5) {
+      const dir = { x: lm[9].x - lm[0].x, y: lm[9].y - lm[0].y };
+      const len = Math.hypot(dir.x, dir.y) || 1;
+      const reach = 450;
+      bolts.push({
+        pts: lightning(target.x, target.y,
+          target.x + (dir.x / len) * reach, target.y + (dir.y / len) * reach),
+        life: 1
+      });
+    }
+  }
+}
+
+function draw(dt, lm, gesture) {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // faint skeleton
+  if (lm) {
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "rgba(255,255,255,.35)";
+    for (const p of lm) {
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, 3, 0, 7);
+      ctx.fill();
+    }
+  }
+
+  ctx.globalCompositeOperation = "lighter";
+
+  // charge orb
+  if (lm && charge > 0.02) {
+    const c = { x: lm[9].x * w, y: lm[9].y * h };
+    const r = 20 + charge * 70 + Math.sin(performance.now() / 80) * 4;
+    const hue = 270 - charge * 240;
+    const grad = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, r);
+    grad.addColorStop(0, `hsla(${hue},100%,80%,.95)`);
+    grad.addColorStop(1, `hsla(${hue},100%,50%,0)`);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, r, 0, 7);
+    ctx.fill();
+  }
+
+  // trail
+  const now = performance.now();
+  trail = trail.filter(p => now - p.t < 1200);
+  if (trail.length > 1) {
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    for (let i = 1; i < trail.length; i++) {
+      const a = trail[i - 1], b = trail[i];
+      if (Math.hypot(a.x - b.x, a.y - b.y) > 200) continue; // skip jumps
+      const age = (now - b.t) / 1200;
+      const alpha = 1 - age;
+      ctx.strokeStyle = `hsla(${280 + age * 80},100%,65%,${alpha})`;
+      ctx.shadowColor = `hsla(${280 + age * 80},100%,60%,1)`;
+      ctx.shadowBlur = 22;
+      ctx.lineWidth = 3 + 9 * alpha;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+  }
+
+  // rings
+  rings = rings.filter(r => r.life > 0);
+  for (const r of rings) {
+    r.r += (r.max - r.r) * Math.min(1, dt * 6);
+    r.life -= dt * 1.6;
+    ctx.strokeStyle = `hsla(${r.hue},100%,65%,${Math.max(0, r.life)})`;
+    ctx.lineWidth = 6 * r.life;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r, 0, 7);
+    ctx.stroke();
+  }
+
+  // lightning bolts
+  bolts = bolts.filter(b => b.life > 0);
+  for (const b of bolts) {
+    b.life -= dt * 6;
+    ctx.strokeStyle = `rgba(170,210,255,${Math.max(0, b.life)})`;
+    ctx.shadowColor = "#8ab8ff";
+    ctx.shadowBlur = 18;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    b.pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // particles
+  particles = particles.filter(p => p.life > 0);
+  for (const p of particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 0.985;
+    p.vy *= 0.985;
+    p.life -= p.decay * dt;
+    ctx.fillStyle = `hsla(${p.hue},100%,60%,${Math.max(0, p.life)})`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * Math.max(0.2, p.life), 0, 7);
+    ctx.fill();
+  }
+  if (particles.length > 1500) particles.splice(0, particles.length - 1500);
+
+  ctx.globalCompositeOperation = "source-over";
+}
+
+// ---------- Main loop ----------
+function loop() {
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - lastTime) / 1000);
+  lastTime = now;
+
+  if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+    lastVideoTime = video.currentTime;
+    lastHands = landmarker.detectForVideo(video, now);
+  }
+
+  let lm = null;
+  let gesture = "none";
+  if (lastHands && lastHands.landmarks.length) {
+    lm = lastHands.landmarks[0];
+    const raw = classify(lm);
+    // require 3 consecutive frames to avoid flicker
+    if (raw === stableGesture) stableCount++;
+    else { stableGesture = raw; stableCount = 1; }
+    gesture = stableCount >= 3 ? raw : lastGesture;
+    update(dt, gesture, lm);
+  } else {
+    charge = Math.max(0, charge - dt);
+    lastGesture = "none";
+  }
+
+  draw(dt, lm, gesture);
+  gEl.textContent = gesture;
+  cEl.textContent = Math.round(charge * 100) + "%";
+  requestAnimationFrame(loop);
+}
+
+async function start() {
+  startBtn.disabled = true;
+  startBtn.textContent = "Loading model...";
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 1
+  });
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 1280, height: 720 }
+  });
+  video.srcObject = stream;
+  await video.play();
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  for (const el of [video, canvas]) {
+    el.style.width = "min(100vw, calc(100vh * " + video.videoWidth / video.videoHeight + "))";
+    el.style.height = "auto";
+  }
+  startBtn.remove();
+  loop();
+}
+
+startBtn.addEventListener("click", () => start().catch(e => {
+  startBtn.disabled = false;
+  startBtn.textContent = "Error: " + e.message + " (click to retry)";
+}));
+</script>
+</body>
+</html>
